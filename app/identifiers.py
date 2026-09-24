@@ -108,6 +108,20 @@ class Occurrence:
     column: int           # 1-based source column (codepoints)
 
 
+@dataclass(frozen=True)
+class RawIdentifier:
+    """One non-keyword identifier occurrence located by the lexical scan.
+
+    This is the shared boundary between the NFKC collision report and any
+    other analysis that needs identifiers with their original-source
+    positions: the lexical rules (and the failure positions) live in one
+    place, and callers only decide what to do with the surviving names.
+    """
+
+    spelling: str
+    occurrence: Occurrence
+
+
 @dataclass
 class SpellingOccurrences:
     spelling: str
@@ -224,10 +238,20 @@ def _is_identifier_continuation(ch: str) -> bool:
     return ("a" + ch).isidentifier()
 
 
-def scan_identifiers(source: str) -> NormalizationReport:
-    """Extract identifiers and build the NFKC collision report.
+def iter_raw_identifiers(source: str):
+    """Yield every non-keyword identifier occurrence in source order.
 
-    Raises :class:`IdentifierLexError` on any lexical failure.
+    This is the shared lexical boundary: the source is lexed per Python's
+    lexical rules (comments, strings, numbers, operators and structural
+    tokens skipped; hard keywords skipped after NFKC normalisation so
+    confusable keyword spellings such as ``Ｔｒｕｅ`` are skipped too),
+    PEP 3131 continuation marks split off by the tokenizer are joined to
+    their name, and every surviving :class:`RawIdentifier` carries its
+    original-source codepoint span and 1-based line/column (a leading BOM
+    is included in all positions).
+
+    Raises :class:`IdentifierLexError` on any lexical failure before the
+    iteration completes.
     """
     # Strip a single leading BOM; remember it so reported offsets stay
     # relative to the original (unstripped) source.
@@ -253,18 +277,13 @@ def scan_identifiers(source: str) -> NormalizationReport:
         """1-based column in the original source."""
         return col + 1 + (1 if tok_line == 1 and bom_offset else 0)
 
-    # normalised form -> raw spelling -> occurrences (insertion order is
-    # source order for both levels)
-    grouped: "OrderedDict[str, OrderedDict[str, list[Occurrence]]]" = OrderedDict()
-    total_identifiers = 0
-    first_seen: dict[str, int] = {}
     # End offset (stripped-source coordinates) of the most recently
     # extracted identifier; used to recognise continuation marks split off
     # from a name by the tokenizer's ``\w+`` matching.
     last_name_end = -1
 
-    def record_name(tok: "tokenize.TokenInfo") -> None:
-        nonlocal total_identifiers, last_name_end
+    def record_name(tok: "tokenize.TokenInfo") -> "Optional[RawIdentifier]":
+        nonlocal last_name_end
         start_line, start_col = tok.start
         stripped_start = stripped_offset(start_line, start_col)
         # The 3.11 tokenizer names identifiers with ``\w+`` and emits each
@@ -281,20 +300,14 @@ def scan_identifiers(source: str) -> NormalizationReport:
         # full-width/confusable keyword spellings are skipped exactly as
         # the interpreter normalises identifiers.
         if keyword.iskeyword(unicodedata.normalize("NFKC", spelling)):
-            return
-        total_identifiers += 1
-        normalised = unicodedata.normalize("NFKC", spelling)
-        offset = stripped_start + bom_offset
+            return None
         occurrence = Occurrence(
-            offset=offset,
+            offset=stripped_start + bom_offset,
             end_offset=end + bom_offset,
             line=start_line,
             column=raw_column(start_line, start_col),
         )
-        by_spelling = grouped.setdefault(normalised, OrderedDict())
-        by_spelling.setdefault(spelling, []).append(occurrence)
-        if normalised not in first_seen:
-            first_seen[normalised] = offset
+        return RawIdentifier(spelling=spelling, occurrence=occurrence)
 
     def unexpected_character(tok: "tokenize.TokenInfo") -> None:
         start_line, start_col = tok.start
@@ -333,7 +346,9 @@ def scan_identifiers(source: str) -> NormalizationReport:
     try:
         for tok in tokenize.generate_tokens(io.StringIO(source).readline):
             if tok.type == tokenize.NAME:
-                record_name(tok)
+                raw = record_name(tok)
+                if raw is not None:
+                    yield raw
             elif tok.type == tokenize.ERRORTOKEN and tok.string:
                 stripped_pos = stripped_offset(*tok.start)
                 # record_name extends the name through every following
@@ -393,6 +408,27 @@ def scan_identifiers(source: str) -> NormalizationReport:
             column=column,
             error="indentation_error",
         )
+
+
+def scan_identifiers(source: str) -> NormalizationReport:
+    """Extract identifiers and build the NFKC collision report.
+
+    Raises :class:`IdentifierLexError` on any lexical failure.
+    """
+    # normalised form -> raw spelling -> occurrences (insertion order is
+    # source order for both levels)
+    grouped: "OrderedDict[str, OrderedDict[str, list[Occurrence]]]" = OrderedDict()
+    total_identifiers = 0
+    first_seen: dict[str, int] = {}
+
+    for raw in iter_raw_identifiers(source):
+        total_identifiers += 1
+        normalised = unicodedata.normalize("NFKC", raw.spelling)
+        occurrence = raw.occurrence
+        by_spelling = grouped.setdefault(normalised, OrderedDict())
+        by_spelling.setdefault(raw.spelling, []).append(occurrence)
+        if normalised not in first_seen:
+            first_seen[normalised] = occurrence.offset
 
     collisions: list[Collision] = []
     for normalised, by_spelling in grouped.items():

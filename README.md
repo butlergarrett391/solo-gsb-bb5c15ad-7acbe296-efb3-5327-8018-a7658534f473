@@ -51,10 +51,11 @@ docker compose up --build
 SQLite 数据文件保存在命名卷 `bidi-audit-data`（容器内 `/data/audit.db`）。
 启动方式无需改动，新增的 `POST /api/v1/audits/diff`、`POST /api/v1/audits/json`、
 `POST /api/v1/audits/gate`、
-`POST /api/v1/identifiers/normalization` 与
-`POST /api/v1/identifiers/normalization/fix-preview`
+`POST /api/v1/identifiers/normalization`、
+`POST /api/v1/identifiers/normalization/fix-preview` 与
+`POST /api/v1/identifiers/mixed-script`
 随服务一起可用（均通过宿主机 8000 端口访问，例如
-<http://localhost:8000/api/v1/identifiers/normalization/fix-preview>）。
+<http://localhost:8000/api/v1/identifiers/mixed-script>）。
 
 ### 仅用 Docker
 
@@ -582,6 +583,97 @@ curl -s -X POST http://localhost:8000/api/v1/identifiers/normalization/fix-previ
 }
 ```
 
+### `POST /api/v1/identifiers/mixed-script` — 混写脚本（拉丁/希腊/西里尔）标识符检测
+
+接收一段 **Python 源码**（`source` 字段，可选 `filename`），识别**单个合法标识符
+内部混用拉丁、希腊、西里尔字母**的伪装名称（如把 `score` 里的 `o` 换成外观几乎相同的
+西里尔字母 U+043E，或把 `alpha` 里的 `a` 换成希腊字母 U+03B1）。
+
+词法边界与错误定位完全复用 NFKC 碰撞接口：
+
+- **注释、字符串字面量、数字、运算符与结构符一律跳过**；
+- Python **硬关键字**（含 NFKC 等宽混淆拼写如 `Ｔｒｕｅ`）不作为标识符，
+  `match` / `case` 等软关键字仍是普通标识符；
+- 源码词法失败时返回与碰撞接口完全相同的 **422** 结构
+  （`error` / `offset` / `line` / `column` / `message`）。
+
+脚本判定规则：逐字符取 **Unicode 名称**，只有名称以 `LATIN`、`GREEK`、`CYRILLIC`
+开头的字母才计入脚本——
+
+- **组合记号**（名称以 `COMBINING` 开头，如 U+0301）、**数字**（`… DIGIT …`）与
+  **下划线**既不增加脚本也不打断标识符；
+- 全角 / 数学粗体等同形异码字母（名称以 `FULLWIDTH` / `MATHEMATICAL` 开头）**不计入
+  拉丁**，因此 `Ｘω` 不会被当作拉丁+希腊混写。
+
+一个标识符的相关字母跨**两类及以上**脚本时即为命中。每次命中返回：
+
+- `spelling` —— 标识符原拼写；`scripts` —— 涉及的脚本（`latin` / `greek` /
+  `cyrillic`，按在该标识符中首次出现排序）；
+- `offset` / `end_offset`（原文 Unicode 码点偏移，0 起始、end 排他）与标识符整体的
+  `line` / `column`（1 起始）；
+- `characters[]` —— **每个相关字母**各自的 `character`、`script`、`codepoint`
+  （`U+XXXX`）、`offset` 与 `line` / `column`，可直接在原始源码上切片复核；
+- **同一伪装名称重复出现时逐次报告**，所有命中按源码位置升序。
+
+该接口**只读**：`stored: false`，不写入任何审计或标识符报告记录。
+
+```bash
+docker compose up --build
+# 'score' 的第二个单词里，o 用的是西里尔字母 U+043E（о），外观与 ASCII o 几乎一致
+curl -s -X POST http://localhost:8000/api/v1/identifiers/mixed-script \
+  -H 'Content-Type: application/json' \
+  -d '{"source": "score = 1\nscоre = 2\n", "filename": "lookalike.py"}' | jq
+```
+
+响应：
+
+```json
+{
+  "stored": false,
+  "filename": "lookalike.py",
+  "source_length": 22,
+  "report": {
+    "identifier_count": 2,
+    "mixed_script_count": 1,
+    "mixed_identifiers": [
+      {
+        "spelling": "scоre",
+        "scripts": ["latin", "cyrillic"],
+        "offset": 10,
+        "end_offset": 15,
+        "line": 2,
+        "column": 1,
+        "characters": [
+          {"character": "s", "script": "latin",   "codepoint": "U+0073",
+           "offset": 10, "line": 2, "column": 1},
+          {"character": "c", "script": "latin",   "codepoint": "U+0063",
+           "offset": 11, "line": 2, "column": 2},
+          {"character": "о", "script": "cyrillic","codepoint": "U+043E",
+           "offset": 12, "line": 2, "column": 3},
+          {"character": "r", "script": "latin",   "codepoint": "U+0072",
+           "offset": 13, "line": 2, "column": 4},
+          {"character": "e", "script": "latin",   "codepoint": "U+0065",
+           "offset": 14, "line": 2, "column": 5}
+        ]
+      }
+    ]
+  }
+}
+```
+
+三脚本混写（拉丁 `a` + 希腊 α U+03B1 + 西里尔 а U+0430）示例：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/identifiers/mixed-script \
+  -H 'Content-Type: application/json' \
+  -d '{"source": "aαа = 1\n"}' | jq '.report.mixed_identifiers[0].scripts'
+# ["latin", "greek", "cyrillic"]
+```
+
+> 字符串字面量与注释里外观相同的混写内容不会被报告；只含单脚本的标识符
+> （纯拉丁、纯希腊、纯西里尔）也不报告。词法失败的 422 与
+> `POST /api/v1/identifiers/normalization` 完全一致。
+
 ### `GET /api/v1/audits` — 查询历史记录
 
 支持按风险级别精确过滤、按文件名（大小写不敏感子串）过滤与分页：
@@ -988,6 +1080,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── diff_audit.py  # unified diff 解析（多文件/多 hunk/No-newline）+ 新增内容回映射
 │   ├── json_audit.py  # 严格 JSON 解析（位置跟踪/转义解码/重复键）+ 字符串值回映射
 │   ├── identifiers.py # Python 标识符提取（tokenize/PEP 3131）+ NFKC 碰撞报告、码点偏移与碰撞修复预览
+│   ├── mixed_script.py # 拉丁/希腊/西里尔混写脚本标识符检测（复用标识符词法边界）
 │   ├── compare.py     # 两条已存审计记录的回归比较（按缩写+出现次序配对）
 │   ├── gate.py        # 路径风险门禁（分段模板匹配 * / **、规则优先级、阈值判定）
 │   ├── verify.py      # 重算校验：从原文重新解析并与存储结果逐字段 diff
@@ -1003,6 +1096,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── test_json_audit.py # JSON 文档审计（指针/偏移/转义/代理对/重复键/422）
 │   ├── test_identifiers.py # 标识符 NFKC 碰撞（提取/关键字/码点偏移/BOM/422/独立落库）
 │   ├── test_identifier_fix_preview.py # 碰撞修复预览（仅改非规范拼写/编辑偏移/重扫/BOM/CRLF/422/不落库）
+│   ├── test_mixed_script.py # 拉丁/希腊/西里尔混写标识符（词法复用/名称脚本规则/逐次报告/码点偏移/422/不落库）
 │   ├── test_compare.py # 回归比较接口测试（新增/消失/位移/配对范围/404/422）
 │   ├── test_gate.py   # 路径风险门禁测试（模板匹配/优先级/默认阈值/只读/404/422）
 │   ├── test_verify.py  # 重算校验接口测试（一致/篡改/缺失 vs null/只读/404）
@@ -1063,7 +1157,13 @@ astral 平面码点偏移、CRLF 与前导 BOM）、仅不同原文拼写才算�
 偏移锚定原文、由编辑无损重建修复源码、其他字符与 BOM/CRLF/字符串/注释逐字保留、
 修复后重扫（目标组消失、其他组保留、标识符总数不变），以及 422 分支（碰撞组
 不存在、单一拼写、仅大小写不同、名称原始拼写规范化后无组、词法失败、缺字段/
-空名称）与成功和失败均不产生任何记录、路由与按 ID 读取互不冲突。
+空名称）与成功和失败均不产生任何记录、路由与按 ID 读取互不冲突；混写脚本检测覆盖
+共享词法边界（注释/字符串/关键字含全角混淆关键字跳过、软关键字保留）、仅
+LATIN/GREEK/CYRILLIC 名称前缀计入脚本（全角/数学字母、组合记号、数字、下划线
+不计）、两脚本与三脚本混写、纯单脚本不报告、同名重复逐次报告且按源码序输出、
+标识符与各相关字母的码点偏移/行列可切片复核（含多行、BOM、CRLF、空源码）、
+词法失败沿用 422 结构，以及 API 的 200/filename 回显/不写任何表/缺字段 422/
+根路由列表。
 
 ## 设计说明
 

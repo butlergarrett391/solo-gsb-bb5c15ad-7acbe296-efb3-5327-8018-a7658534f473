@@ -26,6 +26,7 @@ from .identifiers import (
     preview_collision_fix,
     scan_identifiers,
 )
+from .mixed_script import scan_mixed_scripts
 from .json_audit import (
     DuplicateKeyError,
     JsonParseError,
@@ -41,6 +42,7 @@ from .schemas import (
     IdentifierCollisionFixRequest,
     IdentifierNormalizationRequest,
     JsonAuditRequest,
+    MixedScriptRequest,
 )
 from .verify import verify_audit_record
 
@@ -392,6 +394,45 @@ def preview_identifier_collision_fix(
     }
 
 
+@app.post("/api/v1/identifiers/mixed-script")
+def create_mixed_script_report(payload: MixedScriptRequest) -> dict:
+    """Find identifiers mixing Latin, Greek and Cyrillic letters.
+
+    The source is lexed with the same scanner as the normalization
+    report: comments, strings and hard keywords (including NFKC-confusable
+    keyword spellings) are skipped.  Inside each surviving identifier only
+    letters whose Unicode name starts with LATIN, GREEK or CYRILLIC count
+    towards a script; combining marks, digits, underscores and any other
+    letters (e.g. fullwidth/mathematical lookalikes) do not count.  An
+    identifier spanning two or more of the scripts is reported for every
+    occurrence -- including the same spelling repeated -- with its raw
+    spelling, the scripts involved and each relevant character's codepoint
+    offset and line/column in the original source.  Read-only: nothing is
+    persisted.  A lexical failure yields the same 422 structure as the
+    normalization endpoints.
+    """
+    try:
+        report = scan_mixed_scripts(payload.source).to_dict()
+    except IdentifierLexError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": exc.error,
+                "offset": exc.offset,
+                "line": exc.line,
+                "column": exc.column,
+                "message": exc.message,
+            },
+        )
+
+    return {
+        "stored": False,
+        "filename": payload.filename,
+        "source_length": len(payload.source),
+        "report": report,
+    }
+
+
 @app.get("/api/v1/audits")
 def list_audits(
     risk_level: Optional[RiskLevel] = Query(
@@ -467,6 +508,7 @@ def root() -> dict:
             "POST /api/v1/audits/gate",
             "POST /api/v1/identifiers/normalization",
             "POST /api/v1/identifiers/normalization/fix-preview",
+            "POST /api/v1/identifiers/mixed-script",
             "GET  /api/v1/audits",
             "GET  /api/v1/audits/{id}",
             "GET  /api/v1/audits/{id}/verify",
