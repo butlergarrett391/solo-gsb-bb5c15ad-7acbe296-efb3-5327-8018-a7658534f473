@@ -33,6 +33,16 @@ other characters are left byte-for-byte untouched; span replacement never
 touches a line ending, and a leading BOM survives as well.  The edited
 source is rescanned so the caller sees the collisions that would remain.
 Nothing is persisted at this layer.
+
+A *mixed-script* scan (:func:`scan_mixed_scripts`) reuses the same lexical
+pass to flag identifiers whose letters mix the Latin, Greek and Cyrillic
+scripts -- the classic homoglyph disguise, e.g. a Cyrillic ``а`` (U+0430)
+inside an otherwise Latin name.  Only characters whose Unicode data name
+starts with ``LATIN``, ``GREEK`` or ``CYRILLIC`` carry a script; combining
+marks, digits, the underscore and lookalikes named otherwise (full-width,
+mathematical letters) are script-neutral.  Every identifier whose letters
+span two or more scripts is reported once per occurrence, listing each
+script-carrying character with its codepoint offset and line/column.
 """
 
 from __future__ import annotations
@@ -106,6 +116,14 @@ class Occurrence:
     end_offset: int       # codepoint offset just past the last character
     line: int             # 1-based source line
     column: int           # 1-based source column (codepoints)
+
+
+@dataclass
+class IdentifierToken:
+    """One non-keyword identifier occurrence, in source order."""
+
+    spelling: str
+    occurrence: Occurrence
 
 
 @dataclass
@@ -224,8 +242,8 @@ def _is_identifier_continuation(ch: str) -> bool:
     return ("a" + ch).isidentifier()
 
 
-def scan_identifiers(source: str) -> NormalizationReport:
-    """Extract identifiers and build the NFKC collision report.
+def _extract_identifiers(source: str) -> list[IdentifierToken]:
+    """Lex *source* and return its non-keyword identifiers in source order.
 
     Raises :class:`IdentifierLexError` on any lexical failure.
     """
@@ -253,18 +271,14 @@ def scan_identifiers(source: str) -> NormalizationReport:
         """1-based column in the original source."""
         return col + 1 + (1 if tok_line == 1 and bom_offset else 0)
 
-    # normalised form -> raw spelling -> occurrences (insertion order is
-    # source order for both levels)
-    grouped: "OrderedDict[str, OrderedDict[str, list[Occurrence]]]" = OrderedDict()
-    total_identifiers = 0
-    first_seen: dict[str, int] = {}
+    tokens: list[IdentifierToken] = []
     # End offset (stripped-source coordinates) of the most recently
     # extracted identifier; used to recognise continuation marks split off
     # from a name by the tokenizer's ``\w+`` matching.
     last_name_end = -1
 
     def record_name(tok: "tokenize.TokenInfo") -> None:
-        nonlocal total_identifiers, last_name_end
+        nonlocal last_name_end
         start_line, start_col = tok.start
         stripped_start = stripped_offset(start_line, start_col)
         # The 3.11 tokenizer names identifiers with ``\w+`` and emits each
@@ -282,19 +296,17 @@ def scan_identifiers(source: str) -> NormalizationReport:
         # the interpreter normalises identifiers.
         if keyword.iskeyword(unicodedata.normalize("NFKC", spelling)):
             return
-        total_identifiers += 1
-        normalised = unicodedata.normalize("NFKC", spelling)
-        offset = stripped_start + bom_offset
-        occurrence = Occurrence(
-            offset=offset,
-            end_offset=end + bom_offset,
-            line=start_line,
-            column=raw_column(start_line, start_col),
+        tokens.append(
+            IdentifierToken(
+                spelling=spelling,
+                occurrence=Occurrence(
+                    offset=stripped_start + bom_offset,
+                    end_offset=end + bom_offset,
+                    line=start_line,
+                    column=raw_column(start_line, start_col),
+                ),
+            )
         )
-        by_spelling = grouped.setdefault(normalised, OrderedDict())
-        by_spelling.setdefault(spelling, []).append(occurrence)
-        if normalised not in first_seen:
-            first_seen[normalised] = offset
 
     def unexpected_character(tok: "tokenize.TokenInfo") -> None:
         start_line, start_col = tok.start
@@ -394,6 +406,27 @@ def scan_identifiers(source: str) -> NormalizationReport:
             error="indentation_error",
         )
 
+    return tokens
+
+
+def scan_identifiers(source: str) -> NormalizationReport:
+    """Extract identifiers and build the NFKC collision report.
+
+    Raises :class:`IdentifierLexError` on any lexical failure.
+    """
+    tokens = _extract_identifiers(source)
+
+    # normalised form -> raw spelling -> occurrences (insertion order is
+    # source order for both levels)
+    grouped: "OrderedDict[str, OrderedDict[str, list[Occurrence]]]" = OrderedDict()
+    first_seen: dict[str, int] = {}
+    for token in tokens:
+        normalised = unicodedata.normalize("NFKC", token.spelling)
+        by_spelling = grouped.setdefault(normalised, OrderedDict())
+        by_spelling.setdefault(token.spelling, []).append(token.occurrence)
+        if normalised not in first_seen:
+            first_seen[normalised] = token.occurrence.offset
+
     collisions: list[Collision] = []
     for normalised, by_spelling in grouped.items():
         if len(by_spelling) < 2:
@@ -420,10 +453,148 @@ def scan_identifiers(source: str) -> NormalizationReport:
     collisions.sort(key=lambda c: first_seen[c.normalised])
 
     return NormalizationReport(
-        identifier_count=total_identifiers,
+        identifier_count=len(tokens),
         distinct_spelling_count=sum(len(m) for m in grouped.values()),
         collision_count=len(collisions),
         collisions=collisions,
+    )
+
+
+# Script classes recognised for homoglyph detection, keyed by the prefix of
+# the character's Unicode data name.  No listed prefix is a prefix of
+# another, so the first match wins unambiguously.
+_SCRIPT_PREFIXES = (
+    ("LATIN", "latin"),
+    ("GREEK", "greek"),
+    ("CYRILLIC", "cyrillic"),
+)
+
+
+def _name_script(ch: str) -> Optional[str]:
+    """Script class carried by *ch*, or ``None`` when it is script-neutral.
+
+    Only characters whose Unicode data name starts with ``LATIN``, ``GREEK``
+    or ``CYRILLIC`` carry a script.  Everything else that may appear inside
+    an identifier -- combining marks, digits, the underscore, and lookalike
+    letters named otherwise (``FULLWIDTH LATIN ...``, ``MATHEMATICAL ...``)
+    -- is script-neutral and never counts towards a mix.
+    """
+    name = unicodedata.name(ch, "")
+    for prefix, script in _SCRIPT_PREFIXES:
+        if name.startswith(prefix):
+            return script
+    return None
+
+
+@dataclass
+class MixedScriptChar:
+    """One script-carrying character of a mixed-script identifier."""
+
+    char: str
+    codepoint: str     # "U+0440" style
+    script: str        # "latin" | "greek" | "cyrillic"
+    offset: int        # codepoint offset in the original source (0-based)
+    line: int          # 1-based source line
+    column: int        # 1-based source column (codepoints)
+
+
+@dataclass
+class MixedScriptFinding:
+    """One occurrence of an identifier mixing two or more scripts."""
+
+    spelling: str
+    scripts: list[str]   # distinct scripts, in first-appearance order
+    offset: int          # codepoint offset of the identifier (0-based)
+    end_offset: int      # codepoint offset just past the identifier
+    line: int            # 1-based source line
+    column: int          # 1-based source column (codepoints)
+    characters: list[MixedScriptChar] = field(default_factory=list)
+
+
+@dataclass
+class MixedScriptReport:
+    identifier_count: int   # total non-keyword identifier occurrences
+    finding_count: int
+    findings: list[MixedScriptFinding] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "identifier_count": self.identifier_count,
+            "finding_count": self.finding_count,
+            "findings": [
+                {
+                    "spelling": f.spelling,
+                    "scripts": f.scripts,
+                    "offset": f.offset,
+                    "end_offset": f.end_offset,
+                    "line": f.line,
+                    "column": f.column,
+                    "characters": [
+                        {
+                            "char": c.char,
+                            "codepoint": c.codepoint,
+                            "script": c.script,
+                            "offset": c.offset,
+                            "line": c.line,
+                            "column": c.column,
+                        }
+                        for c in f.characters
+                    ],
+                }
+                for f in self.findings
+            ],
+        }
+
+
+def scan_mixed_scripts(source: str) -> MixedScriptReport:
+    """Extract identifiers and report those mixing Latin/Greek/Cyrillic.
+
+    Every occurrence of an identifier whose letters span two or more of the
+    recognised scripts is reported separately, in source order; a repeated
+    name therefore appears once per occurrence.  Raises
+    :class:`IdentifierLexError` on any lexical failure.
+    """
+    tokens = _extract_identifiers(source)
+    findings: list[MixedScriptFinding] = []
+    for token in tokens:
+        occurrence = token.occurrence
+        characters: list[MixedScriptChar] = []
+        scripts: list[str] = []
+        # Identifiers never span lines, so each character's column is the
+        # identifier's column plus its codepoint index within the spelling.
+        for index, ch in enumerate(token.spelling):
+            script = _name_script(ch)
+            if script is None:
+                continue
+            if script not in scripts:
+                scripts.append(script)
+            characters.append(
+                MixedScriptChar(
+                    char=ch,
+                    codepoint=f"U+{ord(ch):04X}",
+                    script=script,
+                    offset=occurrence.offset + index,
+                    line=occurrence.line,
+                    column=occurrence.column + index,
+                )
+            )
+        if len(scripts) < 2:
+            continue
+        findings.append(
+            MixedScriptFinding(
+                spelling=token.spelling,
+                scripts=scripts,
+                offset=occurrence.offset,
+                end_offset=occurrence.end_offset,
+                line=occurrence.line,
+                column=occurrence.column,
+                characters=characters,
+            )
+        )
+    return MixedScriptReport(
+        identifier_count=len(tokens),
+        finding_count=len(findings),
+        findings=findings,
     )
 
 

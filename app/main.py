@@ -25,6 +25,7 @@ from .identifiers import (
     IdentifierLexError,
     preview_collision_fix,
     scan_identifiers,
+    scan_mixed_scripts,
 )
 from .json_audit import (
     DuplicateKeyError,
@@ -41,6 +42,7 @@ from .schemas import (
     IdentifierCollisionFixRequest,
     IdentifierNormalizationRequest,
     JsonAuditRequest,
+    MixedScriptRequest,
 )
 from .verify import verify_audit_record
 
@@ -338,6 +340,42 @@ def read_identifier_normalization(report_id: int) -> dict:
     return record
 
 
+@app.post("/api/v1/identifiers/mixed-script")
+def report_mixed_script_identifiers(payload: MixedScriptRequest) -> dict:
+    """Detect identifiers mixing Latin, Greek and Cyrillic letters.
+
+    The source is lexed with the same scanner as the normalization report:
+    comments, strings and hard keywords never count as identifiers.  Inside
+    each surviving identifier only characters whose Unicode name starts
+    with LATIN, GREEK or CYRILLIC carry a script; combining marks, digits
+    and underscores are script-neutral.  Every identifier whose letters
+    span two or more scripts is reported once per occurrence, in source
+    order, with its raw spelling, the scripts involved and each
+    script-carrying character's codepoint offset and line/column.  The
+    endpoint is analysis-only: nothing is persisted.  A lexical failure
+    yields 422 with the original-source position.
+    """
+    try:
+        report = scan_mixed_scripts(payload.source).to_dict()
+    except IdentifierLexError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": exc.error,
+                "offset": exc.offset,
+                "line": exc.line,
+                "column": exc.column,
+                "message": exc.message,
+            },
+        )
+    return {
+        "stored": False,
+        "filename": payload.filename,
+        "source_length": len(payload.source),
+        "report": report,
+    }
+
+
 @app.post("/api/v1/identifiers/normalization/fix-preview")
 def preview_identifier_collision_fix(
     payload: IdentifierCollisionFixRequest,
@@ -467,6 +505,7 @@ def root() -> dict:
             "POST /api/v1/audits/gate",
             "POST /api/v1/identifiers/normalization",
             "POST /api/v1/identifiers/normalization/fix-preview",
+            "POST /api/v1/identifiers/mixed-script",
             "GET  /api/v1/audits",
             "GET  /api/v1/audits/{id}",
             "GET  /api/v1/audits/{id}/verify",

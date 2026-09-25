@@ -51,10 +51,11 @@ docker compose up --build
 SQLite 数据文件保存在命名卷 `bidi-audit-data`（容器内 `/data/audit.db`）。
 启动方式无需改动，新增的 `POST /api/v1/audits/diff`、`POST /api/v1/audits/json`、
 `POST /api/v1/audits/gate`、
-`POST /api/v1/identifiers/normalization` 与
-`POST /api/v1/identifiers/normalization/fix-preview`
+`POST /api/v1/identifiers/normalization`、
+`POST /api/v1/identifiers/normalization/fix-preview` 与
+`POST /api/v1/identifiers/mixed-script`
 随服务一起可用（均通过宿主机 8000 端口访问，例如
-<http://localhost:8000/api/v1/identifiers/normalization/fix-preview>）。
+<http://localhost:8000/api/v1/identifiers/mixed-script>）。
 
 ### 仅用 Docker
 
@@ -582,6 +583,76 @@ curl -s -X POST http://localhost:8000/api/v1/identifiers/normalization/fix-previ
 }
 ```
 
+### `POST /api/v1/identifiers/mixed-script` — 标识符拉丁/希腊/西里尔混写检测
+
+接收 **Python 源码**（`source`，可选 `filename`），复用与 NFKC 碰撞检测**完全相同
+的词法扫描**（注释、字符串、硬关键字跳过，词法失败的 422 结构一致），找出
+**单个合法标识符内部混用拉丁、希腊、西里尔字母**的伪装名称（homoglyph 攻击，
+例如用西里尔 `а` U+0430 冒充拉丁 `a`、用希腊 `ο` U+03BF 冒充拉丁 `o`）：
+
+- 仅 **Unicode 字符名称以 `LATIN` / `GREEK` / `CYRILLIC` 开头**的字符计入脚本；
+  组合记号、数字、下划线都是脚本中性的，不参与判定；全角（`FULLWIDTH LATIN ...`）
+  与数学字母（`MATHEMATICAL ...`）等名称不以这三个前缀开头的形似字符同样不计；
+- 标识符的计脚字符覆盖**两类及以上**脚本即报告；同名标识符**每次出现逐次报告**，
+  全部命中按源码顺序排列。
+
+每个命中返回原拼写 `spelling`、涉及的脚本 `scripts[]`（按拼写内首次出现排序）、
+标识符自身的 `offset` / `end_offset` / `line` / `column`，以及**每个计脚字符**的
+`characters[]`：`char`、`codepoint`（`U+XXXX` 形式）、`script`、原文码点偏移
+`offset` 与 1 起始行列（脚本中性字符不列入，其偏移自然跳过）。该接口**只做分析**：
+`stored: false`，不写入任何记录。
+
+`docker compose up --build` 启动后在宿主机直接调用：
+
+```bash
+# 源码第一个标识符为 p + 西里尔 а（U+0430，JSON 里写作 \u0430 转义）+ y，
+# 第二个为纯拉丁 pay；JSON 转义写法可避免西里尔字母被输入法/编辑器替换
+curl -s -X POST http://localhost:8000/api/v1/identifiers/mixed-script \
+  -H 'Content-Type: application/json' \
+  -d '{"source": "p\u0430y = 1\npay = 2\n", "filename": "pay.py"}' | jq
+```
+
+响应：
+
+```json
+{
+  "stored": false,
+  "filename": "pay.py",
+  "source_length": 16,
+  "report": {
+    "identifier_count": 2,
+    "finding_count": 1,
+    "findings": [
+      {
+        "spelling": "pаy",
+        "scripts": ["latin", "cyrillic"],
+        "offset": 0,
+        "end_offset": 3,
+        "line": 1,
+        "column": 1,
+        "characters": [
+          {"char": "p", "codepoint": "U+0070", "script": "latin",
+           "offset": 0, "line": 1, "column": 1},
+          {"char": "а", "codepoint": "U+0430", "script": "cyrillic",
+           "offset": 1, "line": 1, "column": 2},
+          {"char": "y", "codepoint": "U+0079", "script": "latin",
+           "offset": 2, "line": 1, "column": 3}
+        ]
+      }
+    ]
+  }
+}
+```
+
+> 上例中 `pаy` 的中间字符是西里尔小写字母 а（U+0430），外观与拉丁 `a` 几乎
+> 无法区分；纯拉丁的 `pay` 单一脚本，不产生命中。`offset` 为 Unicode 码点偏移，
+> 可直接在原始源码上切片复核。
+
+错误情况：源码词法扫描失败返回 **422**，`detail` 结构与标识符碰撞检测接口完全
+一致（`error` 为 `unexpected_character` / `unterminated_string` /
+`unterminated_statement` / `indentation_error`，含原文码点偏移 `offset` 与
+`line` / `column`）；缺少 `source` 字段返回 422（Pydantic 校验）。
+
 ### `GET /api/v1/audits` — 查询历史记录
 
 支持按风险级别精确过滤、按文件名（大小写不敏感子串）过滤与分页：
@@ -987,7 +1058,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── bidi.py        # UAX#9 控制符解析、配对栈、风险评级、转义预览
 │   ├── diff_audit.py  # unified diff 解析（多文件/多 hunk/No-newline）+ 新增内容回映射
 │   ├── json_audit.py  # 严格 JSON 解析（位置跟踪/转义解码/重复键）+ 字符串值回映射
-│   ├── identifiers.py # Python 标识符提取（tokenize/PEP 3131）+ NFKC 碰撞报告、码点偏移与碰撞修复预览
+│   ├── identifiers.py # Python 标识符提取（tokenize/PEP 3131）+ NFKC 碰撞报告、码点偏移、碰撞修复预览与拉丁/希腊/西里尔混写检测
 │   ├── compare.py     # 两条已存审计记录的回归比较（按缩写+出现次序配对）
 │   ├── gate.py        # 路径风险门禁（分段模板匹配 * / **、规则优先级、阈值判定）
 │   ├── verify.py      # 重算校验：从原文重新解析并与存储结果逐字段 diff
@@ -1003,6 +1074,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── test_json_audit.py # JSON 文档审计（指针/偏移/转义/代理对/重复键/422）
 │   ├── test_identifiers.py # 标识符 NFKC 碰撞（提取/关键字/码点偏移/BOM/422/独立落库）
 │   ├── test_identifier_fix_preview.py # 碰撞修复预览（仅改非规范拼写/编辑偏移/重扫/BOM/CRLF/422/不落库）
+│   ├── test_mixed_script.py # 标识符混写检测（脚本分类/逐字符偏移/逐次报告/BOM/CRLF/422/不落库）
 │   ├── test_compare.py # 回归比较接口测试（新增/消失/位移/配对范围/404/422）
 │   ├── test_gate.py   # 路径风险门禁测试（模板匹配/优先级/默认阈值/只读/404/422）
 │   ├── test_verify.py  # 重算校验接口测试（一致/篡改/缺失 vs null/只读/404）
@@ -1063,7 +1135,11 @@ astral 平面码点偏移、CRLF 与前导 BOM）、仅不同原文拼写才算�
 偏移锚定原文、由编辑无损重建修复源码、其他字符与 BOM/CRLF/字符串/注释逐字保留、
 修复后重扫（目标组消失、其他组保留、标识符总数不变），以及 422 分支（碰撞组
 不存在、单一拼写、仅大小写不同、名称原始拼写规范化后无组、词法失败、缺字段/
-空名称）与成功和失败均不产生任何记录、路由与按 ID 读取互不冲突。
+空名称）与成功和失败均不产生任何记录、路由与按 ID 读取互不冲突；标识符混写检测
+覆盖按 Unicode 名称前缀的脚本分类（仅 LATIN/GREEK/CYRILLIC 计脚，组合记号、数字、
+下划线与全角/数学字母均中性）、两类及以上脚本命中、逐字符码点偏移与行列（含
+BOM/CRLF/多行）、同名逐次报告与多命中源码序、字符串/注释/关键字跳过与西里尔
+关键字形近词命中、词法失败 422 结构一致、缺字段 422，以及分析只读不产生任何记录。
 
 ## 设计说明
 

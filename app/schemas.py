@@ -81,6 +81,23 @@ class IdentifierNormalizationRequest(BaseModel):
     )
 
 
+class MixedScriptRequest(BaseModel):
+    source: str = Field(
+        ...,
+        description=(
+            "Python source code. Identifiers are extracted per Python's "
+            "lexical rules (comments, strings and hard keywords skipped) "
+            "and checked for spellings that mix Latin, Greek and Cyrillic "
+            "letters inside a single identifier."
+        ),
+    )
+    filename: Optional[str] = Field(
+        default=None,
+        max_length=4096,
+        description="Optional source file name, echoed back in the response.",
+    )
+
+
 class IdentifierCollisionFixRequest(BaseModel):
     source: str = Field(
         ...,
